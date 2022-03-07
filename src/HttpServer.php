@@ -2,11 +2,12 @@
 
 namespace Amp\Http\Server;
 
+use Amp\CompositeException;
+use Amp\Future;
 use Amp\Http\Server\Driver\ClientFactory;
 use Amp\Http\Server\Driver\DefaultHttpDriverFactory;
 use Amp\Http\Server\Driver\HttpDriverFactory;
 use Amp\Http\Server\Driver\SocketClientFactory;
-use Amp\Http\Server\Internal\PerformanceRecommender;
 use Amp\Http\Server\Middleware\CompressionMiddleware;
 use Amp\Socket;
 use Amp\Socket\SocketServer;
@@ -24,6 +25,8 @@ final class HttpServer
     private ClientFactory $clientFactory;
 
     private HttpDriverFactory $driverFactory;
+
+    private \SplObjectStorage $observers;
 
     /** @var SocketServer[] */
     private array $sockets;
@@ -65,6 +68,9 @@ final class HttpServer
                 $this->requestHandler = Middleware\stack($this->requestHandler, new CompressionMiddleware);
             }
         }
+
+        $this->observers = new \SplObjectStorage;
+        $this->observers->attach(new Internal\PerformanceRecommender);
 
         $this->sockets = $sockets;
         $this->clientFactory = $clientFactory ?? new SocketClientFactory;
@@ -147,6 +153,20 @@ final class HttpServer
     }
 
     /**
+     * Attach an observer.
+     *
+     * @throws \Error If the server has started.
+     */
+    public function attach(ServerObserver $observer): void
+    {
+        if ($this->status !== HttpServerStatus::Stopped) {
+            throw new \Error("Cannot attach observers after the server has started");
+        }
+
+        $this->observers->attach($observer);
+    }
+
+    /**
      * Start the server.
      */
     public function start(): void
@@ -155,9 +175,41 @@ final class HttpServer
             throw new \Error("Cannot start server: " . $this->status->getLabel());
         }
 
+        if ($this->driverFactory instanceof ServerObserver) {
+            $this->observers->attach($this->driverFactory);
+        }
+
+        if ($this->clientFactory instanceof ServerObserver) {
+            $this->observers->attach($this->clientFactory);
+        }
+
+        if ($this->requestHandler instanceof ServerObserver) {
+            $this->observers->attach($this->requestHandler);
+        }
+
+        if ($this->errorHandler instanceof ServerObserver) {
+            $this->observers->attach($this->errorHandler);
+        }
+
+        $this->status = HttpServerStatus::Starting;
+
+        $futures = [];
+        foreach ($this->observers as $observer) {
+            $futures[] = async(fn () => $observer->onStart($this, $this->logger, $this->errorHandler));
+        }
+
+        [$exceptions] = Future\awaitAll($futures);
+
         $this->status = HttpServerStatus::Started;
 
-        (new PerformanceRecommender())->onStart($this);
+        if (!empty($exceptions)) {
+            try {
+                $this->stop();
+            } finally {
+                throw new CompositeException($exceptions, "onStart observer initialization failure");
+            }
+        }
+
         $this->logger->info("Started server");
 
         foreach ($this->sockets as $socket) {
@@ -221,7 +273,18 @@ final class HttpServer
             $socket->close();
         }
 
+        $futures = [];
+        foreach ($this->observers as $observer) {
+            $futures[] = async(fn () => $observer->onStop($this));
+        }
+
+        [$exceptions] = Future\awaitAll($futures);
+
         $this->logger->debug("Stopped server");
         $this->status = HttpServerStatus::Stopped;
+
+        if (!empty($exceptions)) {
+            throw new CompositeException($exceptions, "onStop observer failure");
+        }
     }
 }
