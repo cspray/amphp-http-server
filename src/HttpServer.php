@@ -22,4 +22,8 @@ interface HttpServer
     public function getServers(): array;
 
     public function getStatus(): HttpServerStatus;
+    
+    public function start(RequestHandler $handler, ErrorHandler $errorHandler) : void;
+    
+    public function stop() : void;
 }
